@@ -1,10 +1,11 @@
+ARG BUILD_ENV=http
+
 #################################################
 # Common base image
 #################################################
 FROM node:14-alpine as common
 RUN mkdir /app && chown node:node /app
 WORKDIR /app
-USER node
 
 # Cache node_modules installation as they change
 # less than code over time.
@@ -21,9 +22,17 @@ COPY src/ src/
 RUN yarn compile
 
 #################################################
+# HTTPS / HTTP stage
+#################################################
+FROM common as build_http
+
+FROM common as build_https
+ONBUILD COPY fullchain.pem privkey.pem /app/
+
+#################################################
 # Production stage
 #################################################
-FROM common
+FROM build_${BUILD_ENV}
 COPY views/ views/
 # It's a toss up on which order offsets and src
 # should be. Offsets are gauranteed to change
