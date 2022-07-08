@@ -1,3 +1,5 @@
+import dotenv from 'dotenv';
+dotenv.config();
 import express from 'express';
 import { Server } from 'http';
 import { Server as HttpsServer } from 'https';
@@ -6,9 +8,11 @@ import { join } from 'path';
 import socketIO from 'socket.io';
 import Tracer from 'tracer';
 import morgan from 'morgan';
-import crypto from 'crypto';
 import peerConfig from './peerConfig';
 import { ICEServer } from './ICEServer';
+import { PublicLobby } from './interfaces/publicLobby';
+import { GameState } from './interfaces/gameState';
+import { lobbyInfo } from './interfaces/lobbyInfo';
 let TurnServer = require('node-turn');
 
 const httpsEnabled = !!process.env.HTTPS;
@@ -63,9 +67,20 @@ if (peerConfig.integratedRelay.enabled) {
 }
 
 const io = socketIO(server);
-
 const clients = new Map<string, Client>();
+const publicLobbies = new Map<string, PublicLobby>();
+const lobbyCodes = new Map<number, string>();
+const allLobbies = new Map<string, lobbyInfo>();
+let lobbyCount = 0;
 
+function removePublicLobby(c: string) {
+	if (publicLobbies.has(c)) {
+		let pid = publicLobbies.get(c).id;
+		io.sockets.in('lobbybrowser').emit('remove_lobby', pid);
+		lobbyCodes.delete(pid);
+		publicLobbies.delete(c);
+	}
+}
 interface Client {
 	playerId: number;
 	clientId: number;
@@ -83,11 +98,12 @@ interface ClientPeerConfig {
 
 app.enable('trust proxy');
 app.set('views', join(__dirname, '../views'));
-app.use('/public',  express.static(join(__dirname, '../public')))
+app.use('/public', express.static(join(__dirname, '../public')));
 app.set('view engine', 'pug');
 app.use(morgan('combined'));
 
 let connectionCount = 0;
+
 let hostname = process.env.HOSTNAME;
 if (!hostname && peerConfig.integratedRelay.enabled) {
 	logger.error('You must set the HOSTNAME environment variable to use the TURN server.');
@@ -95,23 +111,41 @@ if (!hostname && peerConfig.integratedRelay.enabled) {
 }
 
 app.get('/', (req, res) => {
-	let address = req.protocol + '://' + req.host;
-	res.render('index', { connectionCount, address });
+	let address = req.protocol + '://' + req.hostname;
+	res.render('index', { connectionCount, address, lobbiesCount: allLobbies.size });
 });
 
 app.get('/health', (req, res) => {
-	let address = req.protocol + '://' + req.host;
+	let address = req.protocol + '://' + req.hostname;
 	res.json({
 		uptime: process.uptime(),
 		connectionCount,
+		lobbiesCount: allLobbies.size,
 		address,
 		name: process.env.NAME,
 	});
 });
 
+app.get('/lobbies', (req, res) => {
+	res.json(Array.from(publicLobbies.values()));
+});
+
+const leaveroom = (socket: socketIO.Socket, code: string) => {
+	if (!code) {
+		return;
+	}
+	if (code && (code.length === 6 || code.length === 4)) socket.leave(code);
+
+	if ((io.sockets.adapter.rooms[code]?.length ?? 0) <= 0) {
+		if (allLobbies.has(code)) {
+			allLobbies.delete(code);
+		}
+		removePublicLobby(code);
+	}
+};
 io.on('connection', (socket: socketIO.Socket) => {
 	connectionCount++;
-	logger.info('Total connected: %d', connectionCount);
+	logger.info('Total connected: %d in %d lobbies', connectionCount, allLobbies.size);
 	let code: string | null = null;
 
 	const clientPeerConfig: ClientPeerConfig = {
@@ -132,8 +166,12 @@ io.on('connection', (socket: socketIO.Socket) => {
 
 	socket.emit('clientPeerConfig', clientPeerConfig);
 
-	socket.on('join', (c: string, id: number, clientId: number) => {
-		if (typeof c !== 'string' || typeof id !== 'number' || typeof clientId !== 'number') {
+	socket.on('join', (c: string, id: number, clientId: number, isHost?: boolean) => {
+		if (
+			typeof c !== 'string' ||
+			typeof id !== 'number' ||
+			typeof clientId !== 'number' 
+		) {
 			socket.disconnect();
 			logger.error(`Socket %s sent invalid join command: %s %d %d`, socket.id, c, id, clientId);
 			return;
@@ -143,14 +181,22 @@ io.on('connection', (socket: socketIO.Socket) => {
 		if (io.sockets.adapter.rooms[c]) {
 			let socketsInLobby = Object.keys(io.sockets.adapter.rooms[c].sockets);
 			for (let s of socketsInLobby) {
-				// if (clients.has(s) && clients.get(s).clientId === clientId) {
-				// 	socket.disconnect();
-				// 	logger.error(`Socket %s sent invalid join command, attempted spoofing another client`);
-				// 	return;
-				// }
 				if (s !== socket.id) otherClients[s] = clients.get(s);
 			}
 		}
+
+		if (!allLobbies.has(c)) {
+			allLobbies.set(c, { code: c, hostId: isHost ? clientId : -1, publicLobbyId: -1, connectedCount: 1 });
+		} else {
+			allLobbies.get(c).connectedCount++;
+			if (isHost) {
+				allLobbies.get(c).hostId = clientId;
+				socket.to(code).broadcast.emit('setHost', clientId);
+			}
+			socket.emit('setHost', allLobbies.get(c).hostId);
+		}
+
+		if (code != c) leaveroom(socket, code);
 		code = c;
 		socket.join(code);
 		socket.to(code).broadcast.emit('join', socket.id, {
@@ -158,6 +204,15 @@ io.on('connection', (socket: socketIO.Socket) => {
 			clientId: clientId,
 		});
 		socket.emit('setClients', otherClients);
+	});
+
+	socket.on('setHost', (c: string, clientId: number) => {
+		if (code === c) {
+			if (allLobbies.has(c)) {
+				allLobbies.get(c).hostId = clientId;
+				socket.to(code).broadcast.emit('setHost', clientId);
+			}
+		}
 	});
 
 	socket.on('id', (id: number, clientId: number) => {
@@ -168,9 +223,11 @@ io.on('connection', (socket: socketIO.Socket) => {
 		}
 		let client = clients.get(socket.id);
 		if (client != null && client.clientId != null && client.clientId !== clientId) {
-///			socket.disconnect();
-			logger.error(`Socket ${socket.id}->${client.clientId}->${clientId}->${id} sent invalid id command, attempted spoofing another client`);
-//			return;
+			///			socket.disconnect();
+			logger.error(
+				`Socket ${socket.id}->${client.clientId}->${clientId}->${id} sent invalid id command, attempted spoofing another client`
+			);
+			//			return;
 		}
 		client = {
 			playerId: id,
@@ -182,9 +239,78 @@ io.on('connection', (socket: socketIO.Socket) => {
 
 	socket.on('leave', () => {
 		if (code) {
-			socket.leave(code);
-			clients.delete(socket.id);
+			leaveroom(socket, code);
+			clients.delete(socket.id); // @ts-ignore
 		}
+	});
+
+	socket.on('VAD', (activity: boolean) => {
+		let client = clients.get(socket.id);
+		if (code && client) {
+			socket.to(code).broadcast.emit('VAD', {
+				activity,
+				client,
+				socketId: socket.id,
+			});
+		}
+	});
+
+	socket.on('join_lobby', (id: number, callbackFn) => {
+		//ban check etc...
+		if (lobbyCodes.has(id) && publicLobbies.has(lobbyCodes.get(id))) {
+			let lobbyCode = lobbyCodes.get(id);
+			let publicLobby = publicLobbies.get(lobbyCode);
+			if (publicLobby.isPublic && publicLobby.gameState === GameState.LOBBY) {
+				callbackFn(0, lobbyCode, publicLobby.server, publicLobby);
+				return;
+			} else {
+				callbackFn(1, 'Lobby is not public anymore');
+			}
+		}
+		callbackFn(1, 'Lobby not found :C');
+	});
+
+	socket.on('lobby', (c: string, publicLobby: PublicLobby) => {
+		if (code != c) {
+			logger.error(`Got request to host lobby while not in it %s`, c, code);
+			return;
+		}
+		if (!publicLobby.isPublic && !publicLobby.isPublic2) {
+			removePublicLobby(c);
+		} else {
+			const publobby = publicLobbies.has(c) ? publicLobbies.get(c) : undefined;
+			const id = publobby ? publobby.id : lobbyCount++;
+			const stateTime =
+				publobby &&
+				((publobby.gameState === GameState.LOBBY && publicLobby.gameState === GameState.LOBBY) ||
+					(publobby.gameState !== GameState.LOBBY && publicLobby.gameState !== GameState.LOBBY))
+					? publobby.stateTime
+					: Date.now();
+			let lobby: PublicLobby = {
+				id,
+				title: publicLobby.title?.substring(0, 20) ?? 'ERROR',
+				host: publicLobby.host?.substring(0, 10) ?? '',
+				current_players: publicLobby.current_players ?? 0,
+				max_players: publicLobby.max_players ?? 0,
+				language: publicLobby.language?.substring(0, 5) ?? '',
+				mods: publicLobby.mods?.substring(0, 20)?.toUpperCase() ?? '',
+				isPublic: publicLobby.isPublic || publicLobby.isPublic2,
+				server: publicLobby.server,
+				gameState: publicLobby.gameState,
+				stateTime,
+			};
+			lobbyCodes.set(id, c);
+			publicLobbies.set(c, lobby);
+			io.sockets.in('lobbybrowser').emit('update_lobby', lobby);
+		}
+	});
+
+	socket.on('remove_lobby', (c: string) => {
+		if (code != c) {
+			logger.error(`Got request to host lobby while not in it %s`, c, code);
+			return;
+		}
+		removePublicLobby(c);
 	});
 
 	socket.on('signal', (signal: Signal) => {
@@ -200,10 +326,20 @@ io.on('connection', (socket: socketIO.Socket) => {
 		});
 	});
 
+	socket.on('lobbybrowser', (open) => {
+		if (!open) {
+			socket.leave('lobbybrowser');
+		} else {
+			socket.join('lobbybrowser');
+			io.sockets.in('lobbybrowser').emit('new_lobbies', Array.from(publicLobbies.values()));
+		}
+	});
+
 	socket.on('disconnect', () => {
+		leaveroom(socket, code);
 		clients.delete(socket.id);
 		connectionCount--;
-		logger.info('Total connected: %d', connectionCount);
+		logger.info('Total connected: %d in %d lobbies', connectionCount, allLobbies.size);
 
 		// if (turnServer) {
 		// 	logger.info(`Removing socket "${socket.id}" as TURN user.`);
@@ -213,4 +349,4 @@ io.on('connection', (socket: socketIO.Socket) => {
 });
 
 server.listen(port);
-logger.info('CrewLink Server started: 127.0.0.1:%s', port);
+logger.info('BetterCrewLink Server started: 127.0.0.1:%s', port);
